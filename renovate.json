@@ -1,0 +1,3 @@
+{
+  "extends": ["github>obinesto/renovate-config"]
+}

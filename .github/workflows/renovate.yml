@@ -1,0 +1,85 @@
+name: Renovate CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: renovate-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.directory }})
+    if: >-
+      startsWith(github.head_ref, 'renovate/') && github.event.pull_request.user.login == 'renovate[bot]' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        directory: ["."]
+    defaults:
+      run:
+        working-directory: ${{ matrix.directory }}
+    env:
+      CI: 'true'
+    steps:
+      - name: Check out the PR commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          package-manager-cache: false
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Build project
+        run: npm run build
+
+  result:
+    name: Renovate build
+    needs: build
+    if: >-
+      always() && !cancelled() && startsWith(github.head_ref, 'renovate/') && github.event.pull_request.user.login == 'renovate[bot]' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require every project build to pass
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          if [ "$BUILD_RESULT" != "success" ]; then
+            echo "::error::A project build failed. Review the build logs before merging this dependency update."
+            exit 1
+          fi
+
+  notify:
+    name: Notify about a failed build
+    needs: result
+    if: ${{ !cancelled() && needs.result.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Notify the repository owner
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body: `@obinesto, the dependency build failed. This PR needs review and will not be merged automatically while its checks fail. [View build logs](${runUrl}).`
+            });
