@@ -1,10 +1,9 @@
-import TaskForm from './components/taskForm'
+import TaskForm from "./components/taskForm";
 
 const App = () => {
-
   return (
     <div>
-      <TaskForm/>
+      <TaskForm />
     </div>
   );
 };
