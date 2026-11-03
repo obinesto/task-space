@@ -1,0 +1,13 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    # Security updates bypass this cooldown and remain immediate.
+    cooldown:
+      default-days: 7
+    # Major upgrades require manual review and code changes when needed.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
