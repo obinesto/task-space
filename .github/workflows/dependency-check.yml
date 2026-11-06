@@ -1,0 +1,60 @@
+name: Dependency compatibility
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependabot-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  peer-dependencies:
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      startsWith(github.head_ref, 'dependabot/') &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft
+    name: Peer dependency check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+          package-manager-cache: false
+      - name: "Validate dependencies in ."
+        working-directory: "."
+        run: |
+          npm ci --strict-peer-deps --ignore-scripts
+          npm ls --all
+
+  project-checks:
+    needs: peer-dependencies
+    name: Project checks and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CI: "true"
+      HUSKY: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+          package-manager-cache: false
+      - name: "Run project checks in ."
+        working-directory: "."
+        run: |
+          npm ci --strict-peer-deps
+          npm ls --all
+          npm run lint -- --max-warnings=-1
+          npm run build

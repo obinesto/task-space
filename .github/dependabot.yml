@@ -1,12 +1,13 @@
 version: 2
 updates:
   - package-ecosystem: "npm"
+    # Open PRs only for security fixes.
+    open-pull-requests-limit: 0
+    # Keep security fixes within the existing package.json version ranges.
+    versioning-strategy: lockfile-only
     directory: "/"
     schedule:
       interval: "daily"
-    # Security updates bypass this cooldown and remain immediate.
-    cooldown:
-      default-days: 7
     # Major upgrades require manual review and code changes when needed.
     ignore:
       - dependency-name: "*"
