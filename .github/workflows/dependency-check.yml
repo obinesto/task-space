@@ -1,42 +1,82 @@
 name: Dependency compatibility
-
-on:
+"on":
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+      - unlabeled
+  pull_request_review:
+    types:
+      - submitted
+      - dismissed
 permissions:
   contents: read
-
+  pull-requests: read
 concurrency:
-  group: dependabot-checks-${{ github.event.pull_request.number }}
+  group: >-
+    dependabot-checks-${{ github.event.pull_request.number }}-${{ ((github.event_name == 'pull_request' &&
+    (!contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || startsWith(github.event.label.name,
+    'security-urgency:'))) || (github.event_name == 'pull_request_review' && github.event.review.user.type == 'User' &&
+    contains(fromJSON('["approved","changes_requested","dismissed"]'), github.event.review.state))) && 'validation' ||
+    'ignored' }}
   cancel-in-progress: true
-
 jobs:
   peer-dependencies:
     if: >-
-      github.event.pull_request.user.login == 'dependabot[bot]' &&
-      startsWith(github.head_ref, 'dependabot/') &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      !github.event.pull_request.draft
+      (github.event.pull_request.user.login == 'dependabot[bot]' && startsWith(github.event.pull_request.head.ref,
+      'dependabot/') && github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft) && ((github.event_name == 'pull_request' &&
+      (!contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || startsWith(github.event.label.name,
+      'security-urgency:'))) || (github.event_name == 'pull_request_review' && github.event.review.user.type == 'User'
+      && contains(fromJSON('["approved","changes_requested","dismissed"]'), github.event.review.state)))
     name: Peer dependency check
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      ready: ${{ steps.policy.outputs.ready }}
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: "26"
           package-manager-cache: false
-      - name: "Validate dependencies in ."
-        working-directory: "."
+      - name: Test dependency policy
+        run: node --test .github/scripts/dependabot-policy.test.cjs
+      - name: Check dependency release policy
+        id: policy
+        uses: actions/github-script@v9
+        with:
+          script: >
+            const policy = require('./.github/scripts/dependabot-policy.cjs');
+
+            await policy.checkReleaseAge({github, context, core, projects:
+            JSON.parse(process.env.DEPENDENCY_PROJECTS)});
+        env:
+          DEPENDENCY_PROJECTS: "[\".\"]"
+      - name: Release age approved
+        if: ${{ steps.policy.outputs.ready == 'true' }}
+        run: echo "Dependency release policy approved."
+      - name: Check out validated project
+        if: ${{ steps.policy.outputs.ready == 'true' }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate dependencies in .
+        if: ${{ steps.policy.outputs.ready == 'true' && contains(fromJSON(steps.policy.outputs.projects), '.') }}
+        working-directory: .
         run: |
           npm ci --strict-peer-deps --ignore-scripts
           npm ls --all
-
   project-checks:
     needs: peer-dependencies
+    if: ${{ needs.peer-dependencies.outputs.ready == 'true' }}
     name: Project checks and build
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -46,15 +86,42 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: "26"
           package-manager-cache: false
-      - name: "Run project checks in ."
-        working-directory: "."
+      - name: Check dependency release policy
+        id: policy
+        uses: actions/github-script@v9
+        with:
+          script: >
+            const policy = require('./.github/scripts/dependabot-policy.cjs');
+
+            await policy.checkReleaseAge({github, context, core, projects:
+            JSON.parse(process.env.DEPENDENCY_PROJECTS)});
+        env:
+          DEPENDENCY_PROJECTS: "[\".\"]"
+      - name: Release age approved
+        if: ${{ steps.policy.outputs.ready == 'true' }}
+        run: echo "Dependency release policy approved."
+      - name: Check out validated project
+        if: ${{ steps.policy.outputs.ready == 'true' }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Run project checks in .
+        if: ${{ steps.policy.outputs.ready == 'true' && contains(fromJSON(steps.policy.outputs.projects), '.') }}
+        working-directory: .
         run: |
           npm ci --strict-peer-deps
           npm ls --all
           npm run lint -- --max-warnings=-1
           npm run build
+run-name: >-
+  ${{ ((github.event_name == 'pull_request' && (!contains(fromJSON('["labeled","unlabeled"]'), github.event.action) ||
+  startsWith(github.event.label.name, 'security-urgency:'))) || (github.event_name == 'pull_request_review' &&
+  github.event.review.user.type == 'User' && contains(fromJSON('["approved","changes_requested","dismissed"]'),
+  github.event.review.state))) && 'Dependency validation' || 'Unrelated dependency event' }}
