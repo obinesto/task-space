@@ -83,7 +83,7 @@ test("exactly seven days is eligible; younger versions are held", async () => {
   const f = gateFixture(); f.metadata = metadata(7);
   assert.equal((await f.run()).state, "ready");
   f.metadata = metadata(7 - 1 / DAY);
-  assert.equal((await f.run()).state, "held"); assert.equal(f.outputs.ready, "false");
+  assert.notEqual((await f.run()).state, "ready"); assert.notEqual(f.outputs.state, "ready");
 });
 test("new transitive versions must also mature", async () => {
   const f = gateFixture();
@@ -92,7 +92,7 @@ test("new transitive versions must also mature", async () => {
   f.metadata.versions["2.0.0"] = { dist: { tarball: entry("2.0.0").resolved } };
   assert.equal((await f.run()).state, "ready");
   f.metadata.time["2.0.0"] = new Date(NOW - DAY).toISOString();
-  assert.equal((await f.run()).state, "held"); assert.equal(f.registryCalls, 2);
+  assert.notEqual((await f.run()).state, "ready"); assert.equal(f.registryCalls, 2);
 });
 for (const [name, mutate] of Object.entries({
   "missing publication date": f => { f.metadata.time = {}; },
@@ -116,7 +116,7 @@ for (const [name, mutate] of Object.entries({
   "uncertain urgency": f => { f.pr.labels = [{ name: "security-urgency:uncertain" }]; },
   "conflicting urgency": f => { f.pr.labels = [{ name: "security-urgency:urgent" }, { name: "security-urgency:standard" }]; },
 })) test(name + " is held without failing or installing", async () => {
-  const f = gateFixture(); mutate(f); assert.equal((await f.run()).state, "held"); assert.equal(f.outputs.ready, "false");
+  const f = gateFixture(); mutate(f); assert.notEqual((await f.run()).state, "ready"); assert.notEqual(f.outputs.state, "ready");
 });
 
 function approve(f, extra = {}) {
@@ -137,7 +137,7 @@ for (const [name, mutate] of Object.entries({
   "requested changes": f => { f.reviews.push({ state: "CHANGES_REQUESTED", user: { login: "other", type: "User" } }); },
   "unverifiable publication date": f => { f.metadata.time = {}; },
 })) test("urgent fix with " + name + " stays held", async () => {
-  const f = gateFixture(); approve(f); mutate(f); assert.equal((await f.run()).state, "held");
+  const f = gateFixture(); approve(f); mutate(f); assert.notEqual((await f.run()).state, "ready");
 });
 test("review events can release the same Dependabot PR", async () => {
   const f = gateFixture(); approve(f); f.context.eventName = "pull_request_review";
@@ -151,7 +151,8 @@ function resolverFixture() {
     head_repository: { full_name: "owner/repo" }, head_branch: pr.head.ref, head_sha: "head", pull_requests: [{ number: 7, base: { sha: "base" } }]
   };
   const f = {
-    pr, run, eventRun: structuredClone(run), jobs: policy.VALIDATION_JOBS.map(name => ({ name, conclusion: "success", steps: [{ name: policy.APPROVED_STEP, conclusion: "success" }] })),
+    pr, run, eventRun: structuredClone(run), jobs: [{ name: policy.POLICY_JOB, conclusion: "success", steps: [{ name: policy.DECISION_PREFIX + "ready. Specific gate reason", conclusion: "success" }] },
+      ...policy.VALIDATION_JOBS.map(name => ({ name, conclusion: "success" }))],
     files: [{ filename: "package-lock.json", status: "modified" }], reviews: [], writes: [], checks: 0,
     gate: "ready", checkExit: 0, report: { exitCode: 1, stdout: '[{"bucket":"fail"}]' }, recentId: 10, branchSha: "head", messages: [], statuses: []
   };
@@ -164,7 +165,8 @@ function resolverFixture() {
         createReview: async args => { f.writes.push(["approve", args]); }, merge: async args => { f.writes.push(["merge", args]); return { data: { merged: f.mergeAllowed !== false } }; },
         update: async args => { f.writes.push(["close", args]); return { data: { ...f.pr, state: "closed", merged: false } }; }
       },
-      repos: { get: async () => ({ data: { allow_squash_merge: true } }), createCommitStatus: async args => { f.statuses.push(args); } },
+      repos: { get: async () => ({ data: { allow_squash_merge: true } }), createCommitStatus: async args => { f.statuses.push(args); },
+        getCombinedStatusForRef: async () => ({ data: { statuses: f.statuses.length ? [f.statuses.at(-1)] : [] } }) },
       git: { getRef: async () => ({ data: { object: { sha: f.branchSha } } }), deleteRef: async args => { f.writes.push(["delete", args]); } },
     }, paginate: async name => name === "pulls" ? [f.pr] : f[name]
   };
@@ -174,67 +176,179 @@ function resolverFixture() {
   return f;
 }
 
-test("resolver preserves successful merges, failure cleanup and holds", async () => {
+test("resolver merges only complete current validations and preserves failed PRs", async () => {
   const original = policy.checkReleaseAge;
   try {
     const scenarios = [
-      ["success", () => { }, ["approve", "merge", "delete"]],
-      ["held peer policy", f => { f.jobs[0].steps[0].conclusion = "skipped"; }, []],
-      ["held project policy", f => { f.jobs[1].steps[0].conclusion = "skipped"; }, []],
-      ["withdrawn urgent approval", f => { f.gate = "held"; }, []],
+      ["success", () => {}, ["approve", "merge", "delete"]],
+      ["held policy", f => { f.jobs[0].steps[0].name = policy.DECISION_PREFIX + "waiting. Specific gate reason"; f.gate = "waiting"; f.jobs[1].conclusion = f.jobs[2].conclusion = "skipped"; }, []],
+      ["missing project validation", f => { f.jobs[2].conclusion = "skipped"; }, []],
+      ["withdrawn urgent approval", f => { f.gate = "approval"; }, []],
+      ["final registry outage", f => { f.gate = "retry"; }, []],
+      ["final integrity mismatch", f => { f.gate = "manual"; }, []],
       ["review event", f => { f.run.event = "pull_request_review"; }, ["approve", "merge", "delete"]],
       ["unrelated event", f => { f.run.display_title = policy.IGNORED_RUN; }, []],
       ["newer unrelated queued run", f => { f.github.rest.actions.listWorkflowRuns = async () => ({ data: { workflow_runs: [{ id: 11, display_title: policy.IGNORED_RUN, status: "queued" }, { id: 10 }] } }); }, ["approve", "merge", "delete"]],
-      ["unsupported pnpm lockfile", f => { f.files[0].filename = "pnpm-lock.yaml"; }, []],
-      ["failed peer install", f => { f.run.conclusion = "failure"; f.jobs[0].conclusion = "failure"; }, ["close", "delete"]],
-      ["failed build", f => { f.run.conclusion = "failure"; f.jobs[1].conclusion = "failure"; }, ["close", "delete"]],
-      ["failure before age approval", f => { f.run.conclusion = "failure"; f.jobs[1].conclusion = "failure"; f.jobs[1].steps[0].conclusion = "skipped"; }, []],
-      ["external failed check", f => { f.checkExit = 1; }, ["close", "delete"]],
+      ["unsupported lockfile", f => { f.files[0].filename = "pnpm-lock.yaml"; }, []],
+      ["failed peer install", f => { f.run.conclusion = "failure"; f.jobs[1].conclusion = "failure"; }, []],
+      ["failed build", f => { f.run.conclusion = "failure"; f.jobs[2].conclusion = "failure"; }, []],
+      ["failed build and registry outage", f => { f.run.conclusion = "failure"; f.jobs[2].conclusion = "failure"; f.gate = "retry"; }, []],
+      ["policy job failed", f => { f.run.conclusion = "failure"; f.jobs[0].conclusion = "failure"; f.jobs[0].steps = []; }, []],
+      ["external failed check", f => { f.checkExit = 1; }, []],
       ["API check error", f => { f.checkExit = 1; f.report = { exitCode: 2, stdout: "error" }; }, []],
       ["cancelled run", f => { f.run.conclusion = "cancelled"; }, []],
       ["stale commit", f => { f.pr = { ...f.pr, head: { ...f.pr.head, sha: "new" } }; }, []],
       ["newer validation", f => { f.recentId = 11; }, []],
+      ["newer attempt", f => { f.latestRun = { ...f.run, run_attempt: 2 }; }, []],
       ["changed base", f => { f.current = { ...f.pr, base: { ...f.pr.base, sha: "new" } }; }, []],
+      ["reviewer objection", f => { f.reviews = [{ state: "CHANGES_REQUESTED", user: { login: "reviewer" } }]; }, []],
       ["merge refused", f => { f.mergeAllowed = false; }, ["approve", "merge"]],
       ["branch advanced", f => { f.branchSha = "new"; }, ["approve", "merge"]],
     ];
     for (const [name, mutate, expected] of scenarios) {
-      const f = resolverFixture(); mutate(f); policy.checkReleaseAge = async () => ({ state: f.gate });
-      await resolvePullRequest(f); assert.deepEqual(f.writes.map(write => write[0]), expected, name);
-      if (name.startsWith("held") || name === "withdrawn urgent approval") {
-        assert.equal(f.statuses.at(-1)?.state, "pending", name);
+      const f = resolverFixture(); mutate(f);
+      let gateCalls = 0;
+      policy.checkReleaseAge = async () => { gateCalls++; return { state: f.gate, reason: "Specific policy reason" }; };
+      await resolvePullRequest(f);
+      assert.deepEqual(f.writes.map(write => write[0]), expected, name);
+      if (name.startsWith("failed")) {
+        assert.equal(f.statuses.at(-1)?.state, "failure", name);
+        assert.match(f.statuses.at(-1).description, /remain open/, name);
+        assert.equal(gateCalls, 0, "a later policy error must not obscure " + name);
+      }
+      if (name === "held policy") {
+        assert.equal(f.statuses.at(-1).description, "Specific gate reason");
+        assert.equal(gateCalls, 0, "preserve the original hold reason without checking the policy again");
+      }
+      if (name.startsWith("final") || name === "withdrawn urgent approval") {
+        assert.match(f.statuses.at(-1).description, /Policy passed earlier; final verification.*Specific policy reason/, name);
+        assert.equal(f.statuses.at(-1).state, name === "final integrity mismatch" ? "failure" : "pending", name);
         assert.equal(f.checks, 0, name);
+      }
+      if (["newer validation", "newer attempt", "stale commit", "cancelled run"].includes(name)) {
+        assert.equal(f.statuses.length, 0, name + " must not overwrite current status");
       }
     }
   } finally { policy.checkReleaseAge = original; }
 });
 
-test("scheduler rechecks only a held current run with a matching tested base", async () => {
-  for (const kind of ["held", "ready", "old-workflow", "new-base", "running", "failed", "expired", "max-attempts", "ignored-newer-run"]) {
-    const pr = gateFixture().pr;
-    const run = {
-      id: 10, event: "pull_request", status: "completed", conclusion: "success", head_sha: "head", run_attempt: 1,
-      created_at: new Date(NOW - 2 * DAY).toISOString(), pull_requests: [{ number: 7, base: { sha: "base" } }]
+function recheckFixture() {
+  const pr = gateFixture().pr;
+  const f = {
+    pr, run: { id: 10, event: "pull_request", status: "completed", conclusion: "success", head_sha: "head", run_attempt: 1,
+      created_at: new Date(NOW - 2 * DAY).toISOString(), pull_requests: [{ number: 7, base: { sha: "base" } }] },
+    jobs: [{ name: policy.POLICY_JOB, conclusion: "success", steps: [{ name: policy.DECISION_PREFIX + "waiting. Specific gate reason", conclusion: "success" }] },
+      ...policy.VALIDATION_JOBS.map(name => ({ name, conclusion: "skipped" }))],
+    reruns: 0, statuses: [], combined: [], errors: [],
+  };
+  f.github = {
+    rest: {
+      actions: {
+        getWorkflow: async () => ({ data: { id: 20 } }),
+        listWorkflowRuns: async () => ({ data: { workflow_runs: f.latest ? [f.latest] : f.run ? [f.run] : [] } }),
+        listJobsForWorkflowRun: "jobs", reRunWorkflow: async () => { if (f.retryError) throw new Error("retry unavailable"); f.reruns++; },
+      }, pulls: { list: "pulls", get: async () => ({ data: f.current || f.pr }) },
+      repos: { createCommitStatus: async args => { f.statuses.push(args); }, getCombinedStatusForRef: async () => ({ data: { statuses: f.statuses.length ? [f.statuses.at(-1)] : f.combined } }) },
+    }, paginate: async name => name === "pulls" ? [pr] : f[name],
+  };
+  f.context = { repo: { owner: "owner", repo: "repo" } };
+  f.core = { info() {}, warning() {}, setFailed: reason => f.errors.push(reason) };
+  return f;
+}
+
+test("scheduler retries holds and transient failures, and flags PRs that need action", async () => {
+  const cases = [
+    ["release age", () => {}, 1, "pending", /retry requested/],
+    ["registry unavailable", f => { f.jobs[0].steps[0].name = policy.DECISION_PREFIX + "retry. Specific gate reason"; }, 1, "pending", /retry requested/],
+    ["policy job failed", f => { f.jobs[0].conclusion = "failure"; f.jobs[0].steps = []; f.run.conclusion = "failure"; }, 1, "pending", /retry requested/],
+    ["waiting approval", f => { f.jobs[0].steps[0].name = policy.DECISION_PREFIX + "approval. Specific gate reason"; }, 0, "pending", /Specific gate reason/],
+    ["manual review", f => { f.jobs[0].steps[0].name = policy.DECISION_PREFIX + "manual. Specific gate reason"; }, 0, "failure", /Specific gate reason/],
+    ["missing decision", f => { f.jobs[0].steps = []; }, 0, "failure", /policy result is unavailable/],
+    ["ready", f => { f.jobs[0].steps[0].name = policy.DECISION_PREFIX + "ready. Specific gate reason"; }, 0],
+    ["final verification outage", f => { f.jobs[0].steps[0].name = policy.DECISION_PREFIX + "ready. Specific gate reason"; f.combined = [{ context: "Dependency release policy", state: "pending", description: policy.FINAL_RETRY_PREFIX + " Registry unavailable" }]; }, 1, "pending", /retry requested/],
+    ["final approval withdrawn", f => { f.jobs[0].steps[0].name = policy.DECISION_PREFIX + "ready. Specific gate reason"; f.combined = [{ context: "Dependency release policy", state: "pending", description: "Policy passed earlier; final verification held. Waiting for approval" }]; }, 0],
+    ["new base", f => { f.run.pull_requests[0].base.sha = "old"; }, 0, "failure", /Rebase/],
+    ["running", f => { f.run.status = "in_progress"; }, 0],
+    ["cancelled", f => { f.run.conclusion = "cancelled"; }, 0, "failure", /cancelled/],
+    ["failed build", f => { f.jobs[2].conclusion = "failure"; f.run.conclusion = "failure"; }, 0, "failure", /remain open/],
+    ["expired", f => { f.run.created_at = new Date(NOW - 31 * DAY).toISOString(); }, 0, "failure", /Reopen/],
+    ["max attempts", f => { f.run.run_attempt = 50; }, 0, "failure", /Reopen/],
+    ["old workflow", f => { f.jobs[0].name = "Old job"; }, 0, "failure", /older workflow/],
+    ["missing validation", f => { f.run = null; }, 0, "failure", /No validation/],
+    ["retry error", f => { f.retryError = true; }, 0],
+  ];
+  for (const [name, mutate, reruns, state, reason] of cases) {
+    const f = recheckFixture(); mutate(f);
+    await policy.recheckHeldPullRequests({ ...f, now: NOW });
+    assert.equal(f.reruns, reruns, name);
+    assert.equal(f.statuses.at(-1)?.state, state, name);
+    if (reason) assert.match(f.statuses.at(-1).description, reason, name);
+    assert.equal(f.errors.length, name === "retry error" ? 1 : 0, name);
+  }
+});
+
+test("policy outcomes distinguish release age, approval, manual review, stale commits and verification errors", async () => {
+  const cases = [
+    ["waiting", f => { f.metadata = metadata(1); }, /Eligible at/],
+    ["approval", f => { approve(f); f.reviews = []; }, /written approval/],
+    ["retry", f => { f.registryError = true; }, /Verification unavailable/],
+    ["manual", f => { f.files.push({ filename: "source.js" }); }, /Manual review required/],
+    ["stale", f => { f.pr.base.sha = "changed"; }, /Rebase or reopen/],
+  ];
+  for (const [state, mutate, reason] of cases) {
+    const f = gateFixture(); mutate(f);
+    const result = await f.run();
+    assert.equal(result.state, state);
+    assert.equal(f.outputs.state, state);
+    assert.equal(f.outputs.reason, result.reason);
+    assert.match(result.reason, reason);
+    assert.deepEqual(JSON.parse(f.outputs.projects), []);
+  }
+});
+
+test("policy approval withdrawn while waiting for other checks prevents merging", async () => {
+  const original = policy.checkReleaseAge;
+  try {
+    const f = resolverFixture();
+    policy.checkReleaseAge = async () => ({ state: f.gate, reason: "Waiting for written approval of this commit." });
+    const check = f.exec.getExecOutput;
+    f.exec.getExecOutput = async (...args) => {
+      const result = await check(...args);
+      f.gate = "approval";
+      return result;
     };
-    const jobs = [{ name: "Peer dependency check", conclusion: "success", steps: [{ name: policy.APPROVED_STEP, conclusion: "skipped" }] }];
-    if (kind === "ready") jobs[0].steps[0].conclusion = "success";
-    if (kind === "old-workflow") jobs[0].steps = [];
-    if (kind === "new-base") run.pull_requests[0].base.sha = "old";
-    if (kind === "running") run.status = "in_progress";
-    if (kind === "failed") run.conclusion = "failure";
-    if (kind === "expired") run.created_at = new Date(NOW - 31 * DAY).toISOString();
-    if (kind === "max-attempts") run.run_attempt = 50;
-    let reruns = 0;
-    const github = {
-      rest: {
-        actions: {
-          getWorkflow: async () => ({ data: { id: 20 } }), listWorkflowRuns: async () => ({ data: { workflow_runs: kind === "ignored-newer-run" ? [{ id: 11, display_title: policy.IGNORED_RUN }, run] : [run] } }),
-          listJobsForWorkflowRun: "jobs", reRunWorkflow: async () => { reruns++; }
-        }, pulls: { list: "pulls" }
-      }, paginate: async name => name === "pulls" ? [pr] : jobs
+    await resolvePullRequest(f);
+    assert.deepEqual(f.writes, []);
+    assert.equal(f.statuses.at(-1).state, "pending");
+    assert.match(f.statuses.at(-1).description, /Policy passed earlier; final verification held.*written approval/);
+  } finally { policy.checkReleaseAge = original; }
+});
+
+test("status descriptions are bounded while logs retain the complete reason", async () => {
+  const f = resolverFixture();
+  const reason = "Manual review required: " + "long detail ".repeat(30);
+  await policy.publishPolicyStatus({ ...f, sha: "head", state: "failure", reason });
+  assert.equal(f.statuses[0].description.length, 140);
+  assert.equal(f.messages.at(-1), reason);
+  await policy.publishPolicyStatus({ ...f, sha: "head", state: "failure", reason });
+  assert.equal(f.statuses.length, 1, "identical status updates must not be posted again");
+});
+
+test("scheduler does not overwrite or retry a validation that changed during inspection", async () => {
+  for (const change of ["head", "base", "run", "attempt"]) {
+    const f = recheckFixture();
+    const paginate = f.github.paginate;
+    f.github.paginate = async name => {
+      const result = await paginate(name);
+      if (name === "jobs") {
+        if (change === "head" || change === "base") f.current = { ...f.pr, [change]: { ...f.pr[change], sha: "changed" } };
+        else f.latest = { ...f.run, ...(change === "run" ? { id: 11 } : { run_attempt: 2 }) };
+      }
+      return result;
     };
-    await policy.recheckHeldPullRequests({ github, context: { repo: { owner: "owner", repo: "repo" } }, core: { info() { }, warning() { } }, now: NOW });
-    assert.equal(reruns, ["held", "ignored-newer-run"].includes(kind) ? 1 : 0, kind);
+    await policy.recheckHeldPullRequests({ ...f, now: NOW });
+    assert.equal(f.reruns, 0, change);
+    assert.equal(f.statuses.length, 0, change);
   }
 });
 
@@ -297,13 +411,13 @@ test("the gate exposes affected projects only after release approval", async () 
     projects: ["api", "app"], fetchMetadata: async () => f.metadata });
   assert.equal((await run()).state, "ready");
   assert.deepEqual(JSON.parse(f.outputs.projects), ["app"]);
-  assert.ok(!Object.hasOwn(f.outputs, "policy-state"));
+  assert.equal(f.outputs.state, "ready");
   f.metadata = metadata(1);
-  assert.equal((await run()).state, "held");
+  assert.notEqual((await run()).state, "ready");
   assert.deepEqual(JSON.parse(f.outputs.projects), []);
   f.metadata = metadata();
   f.github.rest.repos.getContent = async args => args.path.endsWith("package-lock.json") ? originalRead(args) : Promise.reject(new Error("manifest unavailable"));
-  assert.equal((await run()).state, "held");
+  assert.notEqual((await run()).state, "ready");
   assert.deepEqual(JSON.parse(f.outputs.projects), []);
 });
 

@@ -31,9 +31,8 @@ async function resolvePullRequest({ github, context, core, exec }) {
     owner, repo, run_id: run.id, filter: "latest", per_page: 100,
   });
   const requiredJobs = policy.VALIDATION_JOBS;
-  const approved = name => jobs.find(job => job.name === name)?.steps?.some(
-    step => step.name === policy.APPROVED_STEP && step.conclusion === "success",
-  );
+  const gate = jobs.find(job => job.name === policy.POLICY_JOB);
+  const decision = policy.readPolicyDecision(gate);
 
   const candidates = await github.paginate(github.rest.pulls.list, {
     owner, repo, state: "open", head: `${owner}:${run.head_branch}`, per_page: 100,
@@ -57,11 +56,6 @@ async function resolvePullRequest({ github, context, core, exec }) {
   const { data: initial } = await github.rest.pulls.get({ owner, repo, pull_number });
   if (!isEligible(initial)) return;
   const baseSha = initial.base.sha;
-  const testedBaseSha = run.pull_requests?.find(pr => pr.number === pull_number)?.base?.sha;
-  if (!testedBaseSha || testedBaseSha !== baseSha) {
-    core.info("The base branch changed or the tested base commit is unavailable.");
-    return;
-  }
 
   const files = await github.paginate(github.rest.pulls.listFiles, {
     owner, repo, pull_number, per_page: 100,
@@ -77,21 +71,11 @@ async function resolvePullRequest({ github, context, core, exec }) {
     return;
   }
 
-  async function markReleasePolicy(state, description) {
-    await github.rest.repos.createCommitStatus({
-      owner, repo, sha: run.head_sha, state,
-      context: "Dependency release policy", description,
-      target_url: run.html_url,
-    });
+  async function markReleasePolicy(state, reason) {
+    await policy.publishPolicyStatus({ github, context, core, sha: run.head_sha, url: run.html_url, state, reason });
   }
 
-  if (!approved("Peer dependency check")) {
-    await markReleasePolicy("pending", "Release policy is held or has not been verified.");
-    core.info("The release policy is held or was not verified. The PR remains open.");
-    return;
-  }
-
-  async function currentPrForResult() {
+  async function currentPrForResult(verifyPolicy = true) {
     const { data: current } = await github.rest.pulls.get({ owner, repo, pull_number });
     const { data: latestRun } = await github.rest.actions.getWorkflowRun({
       owner, repo, run_id: run.id,
@@ -101,7 +85,6 @@ async function resolvePullRequest({ github, context, core, exec }) {
     });
     if (
       !isEligible(current) ||
-      current.base.sha !== baseSha ||
       latestRun.status !== "completed" ||
       latestRun.conclusion !== run.conclusion ||
       latestRun.run_attempt !== run.run_attempt ||
@@ -110,13 +93,20 @@ async function resolvePullRequest({ github, context, core, exec }) {
       core.info("The PR or its validation changed. Fresh validation is required.");
       return null;
     }
+    const testedBase = run.pull_requests?.find(pr => pr.number === pull_number)?.base?.sha;
+    if (current.base.sha !== baseSha || testedBase !== current.base.sha) {
+      await markReleasePolicy("failure", "The base branch changed. Rebase the PR to validate the current base.");
+      return null;
+    }
+    if (!verifyPolicy) return current;
     const releasePolicy = await policy.checkReleaseAge({
       github,
       context: { ...context, eventName: run.event, payload: { pull_request: current } },
       core: { setOutput() { }, info: message => core.info(message) },
     });
     if (releasePolicy.state !== "ready") {
-      await markReleasePolicy("pending", "Release policy needs more time or a reviewed exception.");
+      await markReleasePolicy(policy.policyStatus(releasePolicy.state),
+        (releasePolicy.state === "retry" ? policy.FINAL_RETRY_PREFIX : "Policy passed earlier; final verification held.") + " " + releasePolicy.reason);
       return null;
     }
     return current;
@@ -140,37 +130,24 @@ async function resolvePullRequest({ github, context, core, exec }) {
     }
   }
 
-  async function closeFailedPr(reason) {
-    const current = await currentPrForResult();
-    if (!current) return;
-    const { data: closed } = await github.rest.pulls.update({
-      owner, repo, pull_number, state: "closed",
-    });
-    if (closed.state !== "closed" || closed.merged || closed.head.sha !== run.head_sha) {
-      core.warning("The PR changed during closure, so its branch was kept.");
-      return;
-    }
-    core.info(reason + " Closed the Dependabot PR without merging.");
-    await deleteValidatedBranch(closed);
-  }
-
-  if (run.conclusion !== "success") {
-    const failed = jobs.some(job => requiredJobs.includes(job.name) && approved(job.name) &&
-      ["failure", "timed_out"].includes(job.conclusion));
-    if (failed) {
-      await closeFailedPr("Dependency validation failed.");
-    } else {
-      await markReleasePolicy("pending", "Validation did not reach an approved release policy.");
-      core.info("No failed dependency validation job was confirmed.");
-    }
+  if (!await currentPrForResult(false)) return;
+  const failed = jobs.filter(job => requiredJobs.includes(job.name) && ["failure", "timed_out"].includes(job.conclusion));
+  if (failed.length) {
+    await markReleasePolicy("failure", failed.map(job => job.name).join(", ") +
+      " failed. The PR and branch remain open. Fix the failure, then rerun validation.");
     return;
   }
-  for (const name of requiredJobs) {
-    if (!approved(name) || !jobs.some(job => job.name === name && job.conclusion === "success")) {
-      await markReleasePolicy("pending", "Release policy or project validation is on hold.");
-      core.info("Required validation did not pass: " + name);
-      return;
-    }
+  if (gate?.conclusion !== "success" || !decision) {
+    await markReleasePolicy("pending", "Release-policy job did not complete. Retry validation; no merge is allowed.");
+    return;
+  }
+  if (decision.state !== "ready") {
+    await markReleasePolicy(policy.policyStatus(decision.state), decision.reason);
+    return;
+  }
+  if (run.conclusion !== "success" || !requiredJobs.every(name => jobs.some(job => job.name === name && job.conclusion === "success"))) {
+    await markReleasePolicy("failure", "Release policy approved, but validation is incomplete. Rerun all jobs before merging.");
+    return;
   }
 
   if (!await currentPrForResult()) return;
@@ -199,7 +176,7 @@ async function resolvePullRequest({ github, context, core, exec }) {
       return;
     }
     if (results.some(check => check.bucket === "fail")) {
-      await closeFailedPr("A PR check failed.");
+      await markReleasePolicy("failure", "Release policy approved, but another PR check failed. The PR and branch remain open; fix the failed check.");
     } else {
       core.setFailed("No failed check was confirmed. The PR branch was kept.");
     }
@@ -219,7 +196,7 @@ async function resolvePullRequest({ github, context, core, exec }) {
     }
   }
   if ([...latestReviews.values()].some(review => review.state === "CHANGES_REQUESTED")) {
-    core.info("A reviewer requested changes. Automatic merging is paused.");
+    await markReleasePolicy("failure", "A reviewer requested changes. Address the review before automatic merging can resume.");
     return;
   }
   const approval = latestReviews.get("github-actions[bot]");

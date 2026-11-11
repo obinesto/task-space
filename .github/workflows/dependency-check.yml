@@ -24,7 +24,7 @@ concurrency:
     'ignored' }}
   cancel-in-progress: true
 jobs:
-  peer-dependencies:
+  release-policy:
     if: >-
       (github.event.pull_request.user.login == 'dependabot[bot]' && startsWith(github.event.pull_request.head.ref,
       'dependabot/') && github.event.pull_request.head.repo.full_name == github.repository &&
@@ -32,11 +32,12 @@ jobs:
       (!contains(fromJSON('["labeled","unlabeled"]'), github.event.action) || startsWith(github.event.label.name,
       'security-urgency:'))) || (github.event_name == 'pull_request_review' && github.event.review.user.type == 'User'
       && contains(fromJSON('["approved","changes_requested","dismissed"]'), github.event.review.state)))
-    name: Peer dependency check
+    name: Release policy check
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
-      ready: ${{ steps.policy.outputs.ready }}
+      state: ${{ steps.policy.outputs.state }}
+      projects: ${{ steps.policy.outputs.projects }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -59,24 +60,34 @@ jobs:
             JSON.parse(process.env.DEPENDENCY_PROJECTS)});
         env:
           DEPENDENCY_PROJECTS: "[\".\"]"
-      - name: Release age approved
-        if: ${{ steps.policy.outputs.ready == 'true' }}
-        run: echo "Dependency release policy approved."
-      - name: Check out validated project
-        if: ${{ steps.policy.outputs.ready == 'true' }}
-        uses: actions/checkout@v7
+      - name: "Policy decision: ${{ steps.policy.outputs.state }}. ${{ steps.policy.outputs.reason }}"
+        env:
+          POLICY_REASON: ${{ steps.policy.outputs.reason }}
+        run: printf '%s\n' "$POLICY_REASON"
+  peer-dependencies:
+    needs: release-policy
+    if: ${{ needs.release-policy.outputs.state == 'ready' }}
+    name: Peer dependency check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+          package-manager-cache: false
       - name: Validate dependencies in .
-        if: ${{ steps.policy.outputs.ready == 'true' && contains(fromJSON(steps.policy.outputs.projects), '.') }}
+        if: ${{ contains(fromJSON(needs.release-policy.outputs.projects), '.') }}
         working-directory: .
         run: |
           npm ci --strict-peer-deps --ignore-scripts
           npm ls --all
   project-checks:
-    needs: peer-dependencies
-    if: ${{ needs.peer-dependencies.outputs.ready == 'true' }}
+    needs: [release-policy, peer-dependencies]
+    if: ${{ needs.release-policy.outputs.state == 'ready' }}
     name: Project checks and build
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -86,34 +97,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: "26"
           package-manager-cache: false
-      - name: Check dependency release policy
-        id: policy
-        uses: actions/github-script@v9
-        with:
-          script: >
-            const policy = require('./.github/scripts/dependabot-policy.cjs');
-
-            await policy.checkReleaseAge({github, context, core, projects:
-            JSON.parse(process.env.DEPENDENCY_PROJECTS)});
-        env:
-          DEPENDENCY_PROJECTS: "[\".\"]"
-      - name: Release age approved
-        if: ${{ steps.policy.outputs.ready == 'true' }}
-        run: echo "Dependency release policy approved."
-      - name: Check out validated project
-        if: ${{ steps.policy.outputs.ready == 'true' }}
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
       - name: Run project checks in .
-        if: ${{ steps.policy.outputs.ready == 'true' && contains(fromJSON(steps.policy.outputs.projects), '.') }}
+        if: ${{ contains(fromJSON(needs.release-policy.outputs.projects), '.') }}
         working-directory: .
         run: |
           npm ci --strict-peer-deps

@@ -21,7 +21,7 @@ jobs:
       contains(fromJSON('["pull_request","pull_request_review"]'), github.event.workflow_run.event) &&
       startsWith(github.event.workflow_run.head_branch, 'dependabot/')) && github.event.workflow_run.display_title !=
       'Unrelated dependency event'
-    name: Merge or close PR
+    name: Resolve validated PR
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
